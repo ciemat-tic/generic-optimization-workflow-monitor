@@ -312,7 +312,11 @@ class SearchBehaviorPanel(_MetricPanel):
         variability = objective_variability_percent(history)
         self.tiles["variability"].set_metric(
             format_fixed(variability, suffix="%") if variability is not None else "N/A",
-            detail="CV over the latest 100 evaluations",
+            detail=(
+                "CV over recent generation checkpoints"
+                if snapshot.artifact_mode == "generation-summary"
+                else "CV over the latest 100 evaluations"
+            ),
             tone=(
                 "warning"
                 if variability is not None and variability > 100
@@ -327,7 +331,11 @@ class SearchBehaviorPanel(_MetricPanel):
         )
         self.tiles["improvement"].set_metric(
             format_fixed(improvement, suffix="%") if improvement is not None else "N/A",
-            detail="Best-so-far change, latest 100 evaluations",
+            detail=(
+                "Best-so-far change, recent generation checkpoints"
+                if snapshot.artifact_mode == "generation-summary"
+                else "Best-so-far change, latest 100 evaluations"
+            ),
             tone=(
                 "good"
                 if improvement is not None and improvement > 0
@@ -339,14 +347,21 @@ class SearchBehaviorPanel(_MetricPanel):
             ),
         )
 
-        valid_rate = snapshot.success_rate * 100.0
-        self.tiles["valid_rate"].set_metric(
-            format_fixed(valid_rate, suffix="%"),
-            detail=f"{snapshot.successful_evaluations} valid objective values",
-            tone="good" if snapshot.successful_evaluations else "warning",
-            series=rolling_valid_rate_series(history),
-            gauge_value=valid_rate,
-        )
+        if snapshot.quality_metrics_complete:
+            valid_rate = snapshot.success_rate * 100.0
+            self.tiles["valid_rate"].set_metric(
+                format_fixed(valid_rate, suffix="%"),
+                detail=f"{snapshot.successful_evaluations} valid objective values",
+                tone="good" if snapshot.successful_evaluations else "warning",
+                series=rolling_valid_rate_series(history),
+                gauge_value=valid_rate,
+            )
+        else:
+            self.tiles["valid_rate"].set_metric(
+                "N/A",
+                detail="Exact validity rate requires --data-mode full",
+                tone="neutral",
+            )
 
         self.tiles["dimensions"].set_metric(
             "N/A",
@@ -383,8 +398,8 @@ class ResourcesPanel(_MetricPanel):
         self.tiles["sources"].set_metric(
             str(snapshot.result_sources),
             detail=(
-                "Generation/result files feeding the monitor; "
-                "increments when a new shard becomes available"
+                f"Artifact mode: {snapshot.artifact_mode}; "
+                "generation summaries/shards feeding the monitor"
             ),
             tone="good" if snapshot.result_sources else "warning",
         )

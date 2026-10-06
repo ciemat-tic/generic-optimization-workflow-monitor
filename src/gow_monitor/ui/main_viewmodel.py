@@ -42,11 +42,15 @@ class MainViewModel(QObject):
         parent: QObject | None = None,
         *,
         gow_pid: int | None = None,
+        data_mode: str = "auto",
         run_controller: RunControlPort | None = None,
         run_resumer: RunResumePort | None = None,
     ) -> None:
         super().__init__(parent)
 
+        self.data_mode = str(data_mode).strip().lower()
+        if self.data_mode not in {"auto", "summary", "full"}:
+            raise ValueError("data_mode must be one of: auto, summary, full")
         self._reader: GowFilesystemRunReader | None = None
         self._snapshots: tuple[RunSnapshot, ...] = ()
         self._histories: dict[str, tuple[EvaluationPoint, ...]] = {}
@@ -72,6 +76,7 @@ class MainViewModel(QObject):
         self.live_refresh = LiveRefreshController(
             self,
             interval_ms=AUTO_REFRESH_INTERVAL_MS,
+            data_mode=self.data_mode,
         )
         self.resource_monitor = ResourceMonitorController(
             self,

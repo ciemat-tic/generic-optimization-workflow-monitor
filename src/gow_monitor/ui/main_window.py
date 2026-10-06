@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         *,
         gow_pid: int | None = None,
+        data_mode: str = "auto",
     ) -> None:
         super().__init__(parent)
 
@@ -49,7 +50,11 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self.setMinimumSize(1280, 760)
 
-        self.viewmodel = MainViewModel(self, gow_pid=gow_pid)
+        self.viewmodel = MainViewModel(
+            self,
+            gow_pid=gow_pid,
+            data_mode=data_mode,
+        )
 
         self.page_titles: dict[str, QLabel] = {}
         self.placeholder_labels: dict[str, QLabel] = {}
@@ -304,12 +309,17 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _load_monitor_data(
         results_root: str | Path,
+        *,
+        data_mode: str = "auto",
     ) -> tuple[
         GowFilesystemRunReader,
         tuple[RunSnapshot, ...],
         dict[str, tuple[EvaluationPoint, ...]],
     ]:
-        reader = GowFilesystemRunReader(results_root)
+        reader = GowFilesystemRunReader(
+            results_root,
+            data_mode=data_mode,
+        )
         snapshots: list[RunSnapshot] = []
         histories: dict[str, tuple[EvaluationPoint, ...]] = {}
 
@@ -327,7 +337,8 @@ class MainWindow(QMainWindow):
         results_root: str | Path,
     ) -> None:
         reader, snapshots, histories = self._load_monitor_data(
-            results_root
+            results_root,
+            data_mode=self.viewmodel.data_mode,
         )
         self.viewmodel.apply_loaded_data(
             reader,
@@ -485,7 +496,11 @@ class MainWindow(QMainWindow):
             reference.run_id,
             reference.problem_id or "unknown",
             evaluations_text,
-            str(snapshot.failed_evaluations),
+            (
+                str(snapshot.failed_evaluations)
+                if snapshot.quality_metrics_complete
+                else "N/A"
+            ),
         )
 
         if self.viewmodel.reader is not None:

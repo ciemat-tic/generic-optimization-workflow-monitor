@@ -85,6 +85,8 @@ class RunHealthPanel(QFrame):
             "stream": _HealthRow("Data stream"),
             "failures": _HealthRow("Failure rate"),
             "progress": _HealthRow("Recent progress"),
+            "fireworks": _HealthRow("FireWorks / HTC"),
+            "archive": _HealthRow("Artifact archive"),
             "state": _HealthRow("Observable state"),
         }
 
@@ -100,31 +102,42 @@ class RunHealthPanel(QFrame):
         history: tuple[EvaluationPoint, ...],
     ) -> None:
         valid_count = snapshot.successful_evaluations
-        if valid_count:
+        if not snapshot.quality_metrics_complete:
             self.rows["stream"].update_status(
-                f"{valid_count} valid objectives available.",
-                "good",
+                "Generation-summary mode: objective quality counts are not scanned.",
+                "info",
+            )
+            failure_severity = "info"
+            self.rows["failures"].update_status(
+                "N/A in scalable summary mode; use --data-mode full for exact counts.",
+                "info",
             )
         else:
-            self.rows["stream"].update_status(
-                "No valid objective has been observed.",
-                "critical",
-            )
+            if valid_count:
+                self.rows["stream"].update_status(
+                    f"{valid_count} valid objectives available.",
+                    "good",
+                )
+            else:
+                self.rows["stream"].update_status(
+                    "No valid objective has been observed.",
+                    "critical",
+                )
 
-        failure_rate = snapshot.failure_rate * 100.0
-        if snapshot.failed_evaluations == 0:
-            failure_severity = "good"
-        elif failure_rate >= 10.0:
-            failure_severity = "critical"
-        else:
-            failure_severity = "warning"
-        self.rows["failures"].update_status(
-            (
-                f"{format_fixed(failure_rate, suffix='%')} "
-                f"({snapshot.failed_evaluations} failed)."
-            ),
-            failure_severity,
-        )
+            failure_rate = snapshot.failure_rate * 100.0
+            if snapshot.failed_evaluations == 0:
+                failure_severity = "good"
+            elif failure_rate >= 10.0:
+                failure_severity = "critical"
+            else:
+                failure_severity = "warning"
+            self.rows["failures"].update_status(
+                (
+                    f"{format_fixed(failure_rate, suffix='%')} "
+                    f"({snapshot.failed_evaluations} failed)."
+                ),
+                failure_severity,
+            )
 
         improvement = recent_improvement_percent(
             history,
@@ -139,25 +152,78 @@ class RunHealthPanel(QFrame):
             self.rows["progress"].update_status(
                 (
                     f"Best improved {format_fixed(improvement, suffix='%')} "
-                    "in the last 100 evaluations."
+                    "over the recent monitored history."
                 ),
                 "good",
             )
         else:
             self.rows["progress"].update_status(
-                "No incumbent improvement in the last 100 evaluations.",
+                "No incumbent improvement in the recent monitored history.",
                 "warning",
+            )
+
+        if snapshot.fireworks_total:
+            fw_severity = (
+                "critical"
+                if snapshot.launcher_inspection_errors
+                else "warning"
+                if snapshot.fireworks_fizzled
+                else "good"
+            )
+            self.rows["fireworks"].update_status(
+                (
+                    f"{snapshot.fireworks_completed} completed, "
+                    f"{snapshot.fireworks_fizzled} fizzled, "
+                    f"{snapshot.fireworks_archived} archived / "
+                    f"{snapshot.fireworks_total} FW; "
+                    f"{snapshot.launches_total} launch(es)."
+                ),
+                fw_severity,
+            )
+        else:
+            self.rows["fireworks"].update_status(
+                "No generation launch manifest is available yet.",
+                "info",
+            )
+
+        archived_total = (
+            snapshot.archived_candidate_generations
+            + snapshot.archived_launcher_generations
+        )
+        if archived_total or snapshot.final_launcher_archive:
+            final_text = (
+                "yes" if snapshot.final_launcher_archive else "no"
+            )
+            self.rows["archive"].update_status(
+                (
+                    f"candidate generations={snapshot.archived_candidate_generations}; "
+                    f"launcher generations={snapshot.archived_launcher_generations}; "
+                    f"final launcher archive={final_text}."
+                ),
+                "good",
+            )
+        else:
+            self.rows["archive"].update_status(
+                "No cold-storage generation archives observed yet.",
+                "info",
             )
 
         state_severity = self._state_severity(snapshot.state)
         self.rows["state"].update_status(
-            f"{snapshot.state.value}; {snapshot.result_sources} source(s).",
+            (
+                f"{snapshot.state.value}; {snapshot.result_sources} source(s); "
+                f"mode={snapshot.artifact_mode}."
+            ),
             state_severity,
         )
 
-        if valid_count == 0 or failure_severity == "critical":
+        if snapshot.launcher_inspection_errors:
             summary, summary_state = "ATTENTION", "attention"
-        elif snapshot.failed_evaluations:
+        elif snapshot.quality_metrics_complete and (
+            valid_count == 0 or failure_severity == "critical"
+        ):
+            summary, summary_state = "ATTENTION", "attention"
+        elif snapshot.quality_metrics_complete and snapshot.failed_evaluations:
             summary, summary_state = "CHECK", "attention"
         else:
             summary, summary_state = "HEALTHY", "healthy"

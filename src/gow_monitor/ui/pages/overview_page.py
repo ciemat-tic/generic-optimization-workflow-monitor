@@ -551,6 +551,7 @@ class OverviewPage(QWidget):
             evaluation_detail = (
                 f"{format_fixed(completion, suffix='%')} completed"
                 f" | {snapshot.result_sources} source(s)"
+                f" | {snapshot.artifact_mode}"
             )
         else:
             evaluation_value = f"{snapshot.evaluation_count:,}"
@@ -566,7 +567,11 @@ class OverviewPage(QWidget):
         )
         self.cards["improvement"].set_value(
             improvement_text,
-            detail="Over last 100 evaluations",
+            detail=(
+                "Over recent generation checkpoints"
+                if snapshot.artifact_mode == "generation-summary"
+                else "Over last 100 evaluations"
+            ),
             tone=(
                 "good"
                 if improvement is not None and improvement > 0.0
@@ -574,20 +579,32 @@ class OverviewPage(QWidget):
             ),
             series=recent_improvement_series(history, reference.direction),
         )
-        self.cards["success"].set_value(
-            format_fixed(success_rate, suffix="%"),
-            detail=f"{snapshot.successful_evaluations} valid objectives",
-            tone="good" if snapshot.successful_evaluations else "warning",
-            series=rolling_valid_rate_series(history),
-            gauge_value=success_rate,
-        )
-        self.cards["failures"].set_value(
-            format_fixed(failure_rate, suffix="%"),
-            detail=f"{snapshot.failed_evaluations} failed evaluations",
-            tone="bad" if snapshot.failed_evaluations else "good",
-            series=rolling_failure_rate_series(history),
-            gauge_value=failure_rate,
-        )
+        if snapshot.quality_metrics_complete:
+            self.cards["success"].set_value(
+                format_fixed(success_rate, suffix="%"),
+                detail=f"{snapshot.successful_evaluations} valid objectives",
+                tone="good" if snapshot.successful_evaluations else "warning",
+                series=rolling_valid_rate_series(history),
+                gauge_value=success_rate,
+            )
+            self.cards["failures"].set_value(
+                format_fixed(failure_rate, suffix="%"),
+                detail=f"{snapshot.failed_evaluations} failed evaluations",
+                tone="bad" if snapshot.failed_evaluations else "good",
+                series=rolling_failure_rate_series(history),
+                gauge_value=failure_rate,
+            )
+        else:
+            self.cards["success"].set_value(
+                "N/A",
+                detail="Not scanned in scalable generation-summary mode",
+                tone="neutral",
+            )
+            self.cards["failures"].set_value(
+                "N/A",
+                detail="Not scanned in scalable generation-summary mode",
+                tone="neutral",
+            )
 
         self._refresh_runtime_cards()
 

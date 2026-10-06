@@ -26,16 +26,26 @@ class _RefreshTaskSignals(QObject):
 
 
 class _RefreshTask(QRunnable):
-    def __init__(self, connection_id: int, selected_path: Path) -> None:
+    def __init__(
+        self,
+        connection_id: int,
+        selected_path: Path,
+        *,
+        data_mode: str = "auto",
+    ) -> None:
         super().__init__()
         self.connection_id = connection_id
         self.selected_path = selected_path
+        self.data_mode = data_mode
         self.signals = _RefreshTaskSignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            reader = GowFilesystemRunReader(self.selected_path)
+            reader = GowFilesystemRunReader(
+                self.selected_path,
+                data_mode=self.data_mode,
+            )
             snapshots: list[RunSnapshot] = []
             histories: dict[str, tuple[EvaluationPoint, ...]] = {}
 
@@ -74,12 +84,16 @@ class LiveRefreshController(QObject):
         parent: QObject | None = None,
         *,
         interval_ms: int = 1000,
+        data_mode: str = "auto",
     ) -> None:
         super().__init__(parent)
         if interval_ms < 100:
             raise ValueError("interval_ms must be at least 100 milliseconds")
 
         self._selected_path: Path | None = None
+        self._data_mode = str(data_mode).strip().lower()
+        if self._data_mode not in {"auto", "summary", "full"}:
+            raise ValueError("data_mode must be one of: auto, summary, full")
         self._connection_id = 0
         self._refresh_in_flight = False
         self._active_task: _RefreshTask | None = None
@@ -118,7 +132,11 @@ class LiveRefreshController(QObject):
         if self._selected_path is None or self._refresh_in_flight:
             return False
 
-        task = _RefreshTask(self._connection_id, self._selected_path)
+        task = _RefreshTask(
+            self._connection_id,
+            self._selected_path,
+            data_mode=self._data_mode,
+        )
         task.signals.completed.connect(self._refresh_completed)
         task.signals.failed.connect(self._refresh_failed)
 

@@ -43,6 +43,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--data-mode",
+        choices=("auto", "summary", "full"),
+        default="auto",
+        help=(
+            "Artifact detail policy. auto uses generation summaries for "
+            "million-scale campaigns, summary always avoids shard scans, "
+            "and full computes exact statistics from generation shards."
+        ),
+    )
+    parser.add_argument(
         "--gow-pid",
         type=_positive_pid,
         help=(
@@ -72,7 +82,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         splash.show()
         application.processEvents()
 
-    window = MainWindow(gow_pid=arguments.gow_pid)
+    window = MainWindow(
+        gow_pid=arguments.gow_pid,
+        data_mode=arguments.data_mode,
+    )
 
     if arguments.results_root is not None:
         results_root = arguments.results_root.expanduser()
