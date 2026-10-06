@@ -36,3 +36,11 @@ ui              PySide6 desktop interface
 For installation, live campaign monitoring and completed-run inspection, see:
 
 - [Running GOW with GOW Monitor](docs/RUNNING_GOW_WITH_MONITOR.md)
+
+### Large HTC campaigns
+
+The monitor understands the generation-oriented artifacts produced by current
+GOW HTC runs (`summary.jsonl`, `generations/g*.jsonl`, FireWorks launch
+manifests and `.tar.zst` archive metadata). For million-scale campaigns the
+default `--data-mode auto` avoids scanning every candidate result. See
+[Running GOW with GOW Monitor](docs/RUNNING_GOW_WITH_MONITOR.md#monitoring-current-gow-htc-campaigns).

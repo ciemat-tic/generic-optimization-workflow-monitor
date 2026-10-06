@@ -455,3 +455,75 @@ Verify:
 - the path is not locked or disconnected
 
 Using an absolute results path is recommended.
+
+## Monitoring current GOW HTC campaigns
+
+Recent GOW HTC runs publish generation-level artifacts specifically so external
+observers do not need to traverse millions of candidate directories:
+
+```text
+<results-root>/runs/<run-id>/
+├── summary.json
+├── summary.jsonl
+├── generations/
+│   ├── g000000.jsonl
+│   ├── g000000.launches.json
+│   ├── g000001.jsonl
+│   └── g000001.launches.json
+└── archives/
+    ├── candidates/g000000.tar.zst
+    ├── launchers/g000000.tar.zst
+    └── manifests/g000000.archive.json
+```
+
+The monitor does not unpack `.tar.zst` files. They are cold-storage artifacts;
+the generation shards and manifests remain the monitoring interface.
+
+### Data modes
+
+`gow-monitor` supports three artifact-reading policies:
+
+```bash
+gow-monitor --results-root /path/to/results --data-mode auto
+```
+
+- `auto` (recommended): for campaigns with at least one million planned
+  evaluations and a `summary.jsonl`, use the lightweight generation summary.
+  Smaller campaigns retain exact shard statistics.
+- `summary`: always prefer `summary.json` + `summary.jsonl`. This scales to very
+  large campaigns without reading every candidate record. Evaluation count,
+  completed generations and best objective are exact; success/failure rates,
+  medians and population diversity are shown as unavailable because GOW does
+  not store those aggregates in `summary.jsonl`.
+- `full`: read `generations/g*.jsonl` for exact statistics. The reader processes
+  immutable new generation shards incrementally instead of rereading the whole
+  campaign on every refresh. Use this when exact failure rates, medians and
+  diversity are more important than the I/O cost.
+
+For a 10M-100M evaluation HTC scan, `auto` is normally the appropriate mode.
+
+### FireWorks and launcher monitoring
+
+When `generations/gXXXXXX.launches.json` is present, the Run Health panel also
+reports FireWork state counts and Launch counts. This is read-only: the monitor
+does not connect to MongoDB or import FireWorks.
+
+Generation launcher archives are detected through their metadata and archive
+paths. Historical `FIZZLED` FireWorks remain visible even if a retry later
+succeeded; therefore a non-zero FIZZLED count is an operational diagnostic, not
+by itself proof that the optimization run failed.
+
+### Archived candidate workdirs
+
+The monitor no longer requires
+`runs/<run-id>/<candidate-id>/result.json` for current HTC runs. Once a
+`gXXXXXX.jsonl` generation shard exists, candidate workdirs may be compressed
+and removed by GOW without breaking monitoring. Legacy runs that only contain
+individual `result.json` files remain supported in `full` mode.
+
+### Before the first completed generation
+
+For current HTC layouts, `auto` deliberately does not recursively scan candidate
+workdirs while the first generation is still running. The monitor shows control
+and FireWorks metadata until the first generation summary/shard is published.
+This avoids turning the monitor itself into an inode-heavy filesystem scan.
