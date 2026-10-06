@@ -93,11 +93,37 @@ class _GenerationMoments:
                 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _CachedShardRun:
-    fingerprint: tuple[tuple[str, int, int], ...]
+    shard_fingerprint: tuple[tuple[str, int, int], ...]
+    state_fingerprint: tuple[tuple[str, int, int], ...]
+    accumulator: _ShardRunAccumulator
+    source_count: int
     snapshot: RunSnapshot
     history: tuple[EvaluationPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchTelemetry:
+    manifest_generations: int = 0
+    fireworks_total: int = 0
+    fireworks_completed: int = 0
+    fireworks_fizzled: int = 0
+    fireworks_archived: int = 0
+    launches_total: int = 0
+    inspection_errors: int = 0
+    archived_candidate_generations: int = 0
+    archived_launcher_generations: int = 0
+    final_launcher_archive: bool = False
+
+
+@dataclass(slots=True)
+class _CachedLaunchTelemetry:
+    directory_fingerprint: tuple[tuple[str, int], ...]
+    manifest_fingerprint: tuple[tuple[str, int, int], ...]
+    report_fingerprint: tuple[tuple[str, int, int], ...]
+    seen_fw_ids: set[str]
+    telemetry: _LaunchTelemetry
 
 
 class _ShardRunAccumulator:
@@ -124,7 +150,9 @@ class _ShardRunAccumulator:
         self.recent_history: deque[EvaluationPoint] = deque(
             maxlen=self._RECENT_HISTORY_POINTS
         )
-        self.seen_keys: set[str] = set()
+        # Generation shards are canonical, de-duplicated GOW artifacts.
+        # Do not retain every candidate id in memory: that set becomes
+        # prohibitive for 10M-100M evaluation campaigns.
         self.parameterized_count = 0
         self.parameter_presence: dict[str, int] = {}
         self.parameter_minima: dict[str, float] = {}
@@ -137,14 +165,8 @@ class _ShardRunAccumulator:
         *,
         source: Path,
     ) -> None:
-        key = GowFilesystemRunReader._record_key(
-            payload,
-            source,
-        )
-        if key in self.seen_keys:
-            return
-        self.seen_keys.add(key)
-
+        # Shards are finalized once per generation by GOW, so duplicate
+        # suppression belongs upstream. Avoid an O(evaluations) identity set.
         self.evaluation_count += 1
         evaluation = self.evaluation_count
         status = GowFilesystemRunReader._fitness_status(payload)
@@ -366,8 +388,24 @@ class GowFilesystemRunReader:
 
     _shard_cache: dict[Path, _CachedShardRun] = {}
     _shard_cache_lock = threading.Lock()
+    _launch_cache: dict[Path, _CachedLaunchTelemetry] = {}
+    _launch_cache_lock = threading.Lock()
+    _AUTO_SUMMARY_THRESHOLD = 1_000_000
 
-    def __init__(self, selected_path: str | Path) -> None:
+    def __init__(
+        self,
+        selected_path: str | Path,
+        *,
+        data_mode: str = "auto",
+        summary_threshold: int = _AUTO_SUMMARY_THRESHOLD,
+    ) -> None:
+        normalized_mode = str(data_mode).strip().lower()
+        if normalized_mode not in {"auto", "summary", "full"}:
+            raise ValueError("data_mode must be one of: auto, summary, full")
+        if summary_threshold < 1:
+            raise ValueError("summary_threshold must be positive")
+        self.data_mode = normalized_mode
+        self.summary_threshold = int(summary_threshold)
         self.resolution = self.resolve_selected_path(selected_path)
         self.selected_path = self.resolution.selected_path
         self.results_root = self.resolution.results_root
@@ -446,6 +484,19 @@ class GowFilesystemRunReader:
         if (path / "results.jsonl").is_file():
             return True
         if (path / "summary.json").is_file():
+            return True
+        if (path / "summary.jsonl").is_file():
+            return True
+        generation_root = path / "generations"
+        if generation_root.is_dir():
+            try:
+                if next(generation_root.glob("g*.jsonl"), None) is not None:
+                    return True
+                if next(generation_root.glob("g*.launches.json"), None) is not None:
+                    return True
+            except OSError:
+                pass
+        if (path / "archives").is_dir():
             return True
         try:
             return next(path.rglob("result.json"), None) is not None
@@ -574,10 +625,408 @@ class GowFilesystemRunReader:
     def history_of(self, run: RunReference) -> tuple[EvaluationPoint, ...]:
         return self.snapshot_and_history_of(run)[1]
 
+    @staticmethod
+    def _summary_rows(run_root: Path) -> tuple[dict[str, Any], ...]:
+        path = run_root / "summary.jsonl"
+        rows: list[dict[str, Any]] = []
+        for _line_number, payload in GowFilesystemRunReader._read_jsonl(path):
+            rows.append(payload)
+        return tuple(rows)
+
+    def _should_use_summary_mode(self, run: RunReference) -> bool:
+        summary_path = run.run_root / "summary.jsonl"
+        if not summary_path.is_file():
+            return False
+        if self.data_mode == "summary":
+            return True
+        if self.data_mode == "full":
+            return False
+        metadata = self._metadata_for(run.run_id, run.run_root)
+        planned = self._nonnegative_int(metadata.get("max_evaluations"))
+        done = self._nonnegative_int(metadata.get("evaluations_done"))
+        scale = planned if planned is not None else (done or 0)
+        return scale >= self.summary_threshold
+
+    @staticmethod
+    def _is_htc_artifact_run(run_root: Path) -> bool:
+        return any(
+            path.exists()
+            for path in (
+                run_root / "launchers",
+                run_root / "generations",
+                run_root / "archives",
+                run_root / "summary.jsonl",
+            )
+        )
+
+    def _launch_telemetry(self, run_root: Path) -> _LaunchTelemetry:
+        generation_root = run_root / "generations"
+        archives_root = run_root / "archives"
+        report_root = archives_root / "manifests"
+        candidates_root = archives_root / "candidates"
+        launchers_root = archives_root / "launchers"
+
+        directory_fingerprint_items: list[tuple[str, int]] = []
+        for directory in (
+            generation_root,
+            report_root,
+            candidates_root,
+            launchers_root,
+        ):
+            try:
+                stat = directory.stat()
+            except OSError:
+                continue
+            directory_fingerprint_items.append((str(directory), stat.st_mtime_ns))
+        directory_fingerprint = tuple(directory_fingerprint_items)
+        cache_key = run_root.resolve()
+        with self._launch_cache_lock:
+            cached = self._launch_cache.get(cache_key)
+        if (
+            cached is not None
+            and cached.directory_fingerprint == directory_fingerprint
+        ):
+            return cached.telemetry
+
+        def _fingerprints(paths: tuple[Path, ...]) -> tuple[tuple[str, int, int], ...]:
+            rows: list[tuple[str, int, int]] = []
+            for path in paths:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                rows.append((str(path), stat.st_size, stat.st_mtime_ns))
+            return tuple(rows)
+
+        try:
+            manifest_paths = tuple(
+                sorted(generation_root.glob("g*.launches.json"))
+            )
+        except OSError:
+            manifest_paths = ()
+        try:
+            report_paths = tuple(
+                sorted(report_root.glob("g*.archive.json"))
+            )
+        except OSError:
+            report_paths = ()
+
+        manifest_fingerprint = _fingerprints(manifest_paths)
+        report_fingerprint = _fingerprints(report_paths)
+
+        exact_cache = (
+            cached is not None
+            and cached.manifest_fingerprint == manifest_fingerprint
+            and cached.report_fingerprint == report_fingerprint
+        )
+
+        try:
+            candidate_archives = len(tuple(candidates_root.glob("g*.tar.zst")))
+        except OSError:
+            candidate_archives = 0
+        try:
+            launcher_archives = len(tuple(launchers_root.glob("g*.tar.zst")))
+        except OSError:
+            launcher_archives = 0
+        final_archive = (launchers_root / "run-final.tar.zst").is_file()
+
+        if exact_cache:
+            assert cached is not None
+            old = cached.telemetry
+            if (
+                old.archived_candidate_generations == candidate_archives
+                and old.archived_launcher_generations == launcher_archives
+                and old.final_launcher_archive == final_archive
+            ):
+                return old
+            telemetry = _LaunchTelemetry(
+                manifest_generations=old.manifest_generations,
+                fireworks_total=old.fireworks_total,
+                fireworks_completed=old.fireworks_completed,
+                fireworks_fizzled=old.fireworks_fizzled,
+                fireworks_archived=old.fireworks_archived,
+                launches_total=old.launches_total,
+                inspection_errors=old.inspection_errors,
+                archived_candidate_generations=candidate_archives,
+                archived_launcher_generations=launcher_archives,
+                final_launcher_archive=final_archive,
+            )
+            cached.telemetry = telemetry
+            return telemetry
+
+        can_extend = (
+            cached is not None
+            and len(manifest_fingerprint) >= len(cached.manifest_fingerprint)
+            and manifest_fingerprint[: len(cached.manifest_fingerprint)]
+            == cached.manifest_fingerprint
+            and len(report_fingerprint) >= len(cached.report_fingerprint)
+            and report_fingerprint[: len(cached.report_fingerprint)]
+            == cached.report_fingerprint
+        )
+
+        if can_extend:
+            assert cached is not None
+            seen_fw_ids = set(cached.seen_fw_ids)
+            previous = cached.telemetry
+            manifest_generations = previous.manifest_generations
+            fireworks_total = previous.fireworks_total
+            fireworks_completed = previous.fireworks_completed
+            fireworks_fizzled = previous.fireworks_fizzled
+            fireworks_archived = previous.fireworks_archived
+            launches_total = previous.launches_total
+            inspection_errors = previous.inspection_errors
+            new_manifest_paths = manifest_paths[len(cached.manifest_fingerprint):]
+            new_report_paths = report_paths[len(cached.report_fingerprint):]
+        else:
+            seen_fw_ids: set[str] = set()
+            manifest_generations = 0
+            fireworks_total = 0
+            fireworks_completed = 0
+            fireworks_fizzled = 0
+            fireworks_archived = 0
+            launches_total = 0
+            inspection_errors = 0
+            new_manifest_paths = manifest_paths
+            new_report_paths = report_paths
+
+        for manifest_path in new_manifest_paths:
+            payload = self._read_json_object(manifest_path)
+            manifest_generations += 1
+            for fw in payload.get("fireworks") or []:
+                if not isinstance(fw, dict):
+                    continue
+                raw_fw_id = fw.get("fw_id")
+                fw_key = (
+                    str(raw_fw_id)
+                    if raw_fw_id is not None
+                    else f"{manifest_path}:{fireworks_total}"
+                )
+                if fw_key in seen_fw_ids:
+                    continue
+                seen_fw_ids.add(fw_key)
+                fireworks_total += 1
+                state = str(fw.get("state") or "").upper()
+                fireworks_completed += int(state == "COMPLETED")
+                fireworks_fizzled += int(state == "FIZZLED")
+                fireworks_archived += int(state == "ARCHIVED")
+                if fw.get("inspection_error"):
+                    inspection_errors += 1
+                launches = fw.get("launches") or []
+                if isinstance(launches, list):
+                    launches_total += len(launches)
+                    inspection_errors += sum(
+                        1
+                        for launch in launches
+                        if isinstance(launch, dict)
+                        and launch.get("inspection_error")
+                    )
+
+        for report_path in new_report_paths:
+            report = self._read_json_object(report_path)
+            skipped = report.get("skipped_launchers") or []
+            if isinstance(skipped, list):
+                inspection_errors += len(skipped)
+
+        telemetry = _LaunchTelemetry(
+            manifest_generations=manifest_generations,
+            fireworks_total=fireworks_total,
+            fireworks_completed=fireworks_completed,
+            fireworks_fizzled=fireworks_fizzled,
+            fireworks_archived=fireworks_archived,
+            launches_total=launches_total,
+            inspection_errors=inspection_errors,
+            archived_candidate_generations=candidate_archives,
+            archived_launcher_generations=launcher_archives,
+            final_launcher_archive=final_archive,
+        )
+        cache = _CachedLaunchTelemetry(
+            directory_fingerprint=directory_fingerprint,
+            manifest_fingerprint=manifest_fingerprint,
+            report_fingerprint=report_fingerprint,
+            seen_fw_ids=seen_fw_ids,
+            telemetry=telemetry,
+        )
+        with self._launch_cache_lock:
+            self._launch_cache[cache_key] = cache
+        return telemetry
+
+    @staticmethod
+    def _objective_from_generation_best(row: dict[str, Any]) -> float | None:
+        best = row.get("generation_best")
+        if not isinstance(best, dict):
+            return None
+        raw = best.get("objective")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _snapshot_and_history_from_summary(
+        self,
+        run: RunReference,
+    ) -> tuple[RunSnapshot, tuple[EvaluationPoint, ...]]:
+        rows = self._summary_rows(run.run_root)
+        metadata = self._metadata_for(run.run_id, run.run_root)
+        telemetry = self._launch_telemetry(run.run_root)
+        history: list[EvaluationPoint] = []
+        cumulative = 0
+        best_so_far: float | None = None
+        latest_objective: float | None = None
+        best_candidate_id: str | None = None
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: self._nonnegative_int(row.get("generation_id"))
+            if self._nonnegative_int(row.get("generation_id")) is not None
+            else 10**12,
+        )
+        for row in ordered_rows:
+            actual = self._nonnegative_int(row.get("actual_count")) or 0
+            cumulative += actual
+            generation_id = self._nonnegative_int(row.get("generation_id"))
+            generation_best = row.get("generation_best")
+            objective = self._objective_from_generation_best(row)
+            candidate_id = (
+                str(generation_best.get("candidate_id"))
+                if isinstance(generation_best, dict)
+                and generation_best.get("candidate_id") is not None
+                else None
+            )
+            if objective is not None:
+                latest_objective = objective
+                if best_so_far is None:
+                    best_so_far = objective
+                    best_candidate_id = candidate_id
+                elif run.direction is ObjectiveDirection.MAXIMIZE:
+                    if objective > best_so_far:
+                        best_so_far = objective
+                        best_candidate_id = candidate_id
+                elif objective < best_so_far:
+                    best_so_far = objective
+                    best_candidate_id = candidate_id
+            if cumulative > 0:
+                history.append(
+                    EvaluationPoint(
+                        evaluation=cumulative,
+                        candidate_id=candidate_id,
+                        status="ok" if objective is not None else "unknown",
+                        objective=objective,
+                        best_so_far=best_so_far,
+                        mean_so_far=None,
+                        median_so_far=None,
+                        generation_id=generation_id,
+                    )
+                )
+
+        best = metadata.get("best")
+        if isinstance(best, dict):
+            try:
+                metadata_best = float(best.get("objective"))
+            except (TypeError, ValueError):
+                metadata_best = None
+            if metadata_best is not None and math.isfinite(metadata_best):
+                best_so_far = metadata_best
+                raw_candidate = best.get("candidate_id")
+                best_candidate_id = (
+                    str(raw_candidate) if raw_candidate is not None else None
+                )
+
+        evaluations_done = self._nonnegative_int(metadata.get("evaluations_done"))
+        evaluation_count = evaluations_done if evaluations_done is not None else cumulative
+        finalized = bool(metadata.get("finalized", False))
+        state = (
+            RunState.COMPLETED
+            if finalized
+            else self._state_from_artifacts(run, has_records=bool(evaluation_count))
+        )
+        finished_at = None
+        if finalized:
+            finished_at = self._timestamp_value(metadata.get("updated_at"))
+            if finished_at is None and ordered_rows:
+                finished_at = self._timestamp_value(ordered_rows[-1].get("timestamp"))
+
+        snapshot = RunSnapshot(
+            reference=run,
+            state=state,
+            evaluation_count=evaluation_count,
+            failed_evaluations=0,
+            result_sources=len(rows),
+            successful_evaluations=0,
+            best_objective=best_so_far,
+            latest_objective=latest_objective,
+            mean_objective=None,
+            median_objective=None,
+            best_candidate_id=best_candidate_id,
+            planned_evaluations=self._nonnegative_int(metadata.get("max_evaluations")),
+            completed_generations=self._nonnegative_int(metadata.get("completed_generations")),
+            history_is_sampled=True,
+            population_diversity=(),
+            run_started_at=None,
+            run_finished_at=finished_at,
+            artifact_mode="generation-summary",
+            quality_metrics_complete=False,
+            fireworks_total=telemetry.fireworks_total,
+            fireworks_completed=telemetry.fireworks_completed,
+            fireworks_fizzled=telemetry.fireworks_fizzled,
+            fireworks_archived=telemetry.fireworks_archived,
+            launches_total=telemetry.launches_total,
+            launch_manifest_generations=telemetry.manifest_generations,
+            archived_candidate_generations=telemetry.archived_candidate_generations,
+            archived_launcher_generations=telemetry.archived_launcher_generations,
+            final_launcher_archive=telemetry.final_launcher_archive,
+            launcher_inspection_errors=telemetry.inspection_errors,
+        )
+        return snapshot, tuple(history)
+
+    def _empty_htc_snapshot(
+        self,
+        run: RunReference,
+    ) -> tuple[RunSnapshot, tuple[EvaluationPoint, ...]]:
+        metadata = self._metadata_for(run.run_id, run.run_root)
+        telemetry = self._launch_telemetry(run.run_root)
+        snapshot = RunSnapshot(
+            reference=run,
+            state=self._state_from_artifacts(run, has_records=False),
+            evaluation_count=self._nonnegative_int(metadata.get("evaluations_done")) or 0,
+            failed_evaluations=0,
+            result_sources=0,
+            successful_evaluations=0,
+            best_objective=(
+                self._fitness_objective({"fitness": metadata.get("best")})
+                if isinstance(metadata.get("best"), dict)
+                else None
+            ),
+            best_candidate_id=(
+                str(metadata["best"].get("candidate_id"))
+                if isinstance(metadata.get("best"), dict)
+                and metadata["best"].get("candidate_id") is not None
+                else None
+            ),
+            planned_evaluations=self._nonnegative_int(metadata.get("max_evaluations")),
+            completed_generations=self._nonnegative_int(metadata.get("completed_generations")),
+            artifact_mode="htc-control",
+            quality_metrics_complete=False,
+            fireworks_total=telemetry.fireworks_total,
+            fireworks_completed=telemetry.fireworks_completed,
+            fireworks_fizzled=telemetry.fireworks_fizzled,
+            fireworks_archived=telemetry.fireworks_archived,
+            launches_total=telemetry.launches_total,
+            launch_manifest_generations=telemetry.manifest_generations,
+            archived_candidate_generations=telemetry.archived_candidate_generations,
+            archived_launcher_generations=telemetry.archived_launcher_generations,
+            final_launcher_archive=telemetry.final_launcher_archive,
+            launcher_inspection_errors=telemetry.inspection_errors,
+        )
+        return snapshot, ()
+
     def snapshot_and_history_of(
         self,
         run: RunReference,
     ) -> tuple[RunSnapshot, tuple[EvaluationPoint, ...]]:
+        if self._should_use_summary_mode(run):
+            return self._snapshot_and_history_from_summary(run)
+
         shard_paths = self._generation_shard_paths(run.run_root)
         if shard_paths:
             cached = self._snapshot_and_history_from_shards(
@@ -585,6 +1034,12 @@ class GowFilesystemRunReader:
                 shard_paths,
             )
             return cached.snapshot, cached.history
+
+        # New HTC runs intentionally avoid exposing millions of candidate
+        # workdirs as the live monitoring API. Before the first generation
+        # shard exists, observe only lightweight control/launcher artifacts.
+        if self.data_mode != "full" and self._is_htc_artifact_run(run.run_root):
+            return self._empty_htc_snapshot(run)
 
         records = self._records_by_attempt(run.run_root)
         return (
@@ -659,6 +1114,7 @@ class GowFilesystemRunReader:
             is not None
         )
         metadata = self._metadata_for(run.run_id, run.run_root)
+        telemetry = self._launch_telemetry(run.run_root)
         return RunSnapshot(
             reference=run,
             state=self._state_from_records(run, records),
@@ -683,6 +1139,18 @@ class GowFilesystemRunReader:
             completed_generations=self._nonnegative_int(
                 metadata.get("completed_generations")
             ),
+            artifact_mode="legacy-records",
+            quality_metrics_complete=True,
+            fireworks_total=telemetry.fireworks_total,
+            fireworks_completed=telemetry.fireworks_completed,
+            fireworks_fizzled=telemetry.fireworks_fizzled,
+            fireworks_archived=telemetry.fireworks_archived,
+            launches_total=telemetry.launches_total,
+            launch_manifest_generations=telemetry.manifest_generations,
+            archived_candidate_generations=telemetry.archived_candidate_generations,
+            archived_launcher_generations=telemetry.archived_launcher_generations,
+            final_launcher_archive=telemetry.final_launcher_archive,
+            launcher_inspection_errors=telemetry.inspection_errors,
         )
 
     def _history_from_records(
@@ -755,91 +1223,115 @@ class GowFilesystemRunReader:
     ) -> _CachedShardRun:
         metadata_path = run.run_root / "summary.json"
         final_results_path = run.run_root / "results.jsonl"
-        fingerprint_items: list[tuple[str, int, int]] = []
+        summary_jsonl_path = run.run_root / "summary.jsonl"
 
+        shard_fingerprint_items: list[tuple[str, int, int]] = []
+        readable_shards: list[Path] = []
         for path in shard_paths:
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            fingerprint_items.append(
+            readable_shards.append(path)
+            shard_fingerprint_items.append(
                 (str(path), stat.st_size, stat.st_mtime_ns)
             )
+        shard_fingerprint = tuple(shard_fingerprint_items)
 
         control_root = run.run_root / "control"
         checkpoint_root = run.run_root / "checkpoint"
-
-        state_paths = (
+        state_paths: list[Path] = [
             metadata_path,
+            summary_jsonl_path,
             final_results_path,
             control_root / "pause.request.json",
             control_root / "pause.ack.json",
             checkpoint_root / "manifest.json",
+        ]
+        generation_root = run.run_root / "generations"
+        archive_root = run.run_root / "archives"
+        state_paths.extend(
+            [
+                generation_root,
+                archive_root / "manifests",
+                archive_root / "candidates",
+                archive_root / "launchers",
+                archive_root / "launchers" / "run-final.tar.zst",
+            ]
         )
 
+        state_fingerprint_items: list[tuple[str, int, int]] = []
         for path in state_paths:
             if not path.is_file():
                 continue
-
             try:
                 stat = path.stat()
             except OSError:
                 continue
-
-            fingerprint_items.append(
-                (
-                    str(path),
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                )
+            state_fingerprint_items.append(
+                (str(path), stat.st_size, stat.st_mtime_ns)
             )
-
-        fingerprint = tuple(fingerprint_items)
+        state_fingerprint = tuple(state_fingerprint_items)
         cache_key = run.run_root.resolve()
 
         with self._shard_cache_lock:
             cached = self._shard_cache.get(cache_key)
-            if cached is not None and cached.fingerprint == fingerprint:
+
+        if cached is not None and cached.shard_fingerprint == shard_fingerprint:
+            if cached.state_fingerprint == state_fingerprint:
                 return cached
-
-        accumulator = _ShardRunAccumulator(run)
-        source_count = 0
-
-        for shard_path in shard_paths:
-            source_count += 1
-            for line_number, payload in self._read_jsonl(shard_path):
-                source = Path(f"{shard_path}#{line_number}")
-                accumulator.consume(payload, source=source)
+            accumulator = cached.accumulator
+            source_count = cached.source_count
+        elif (
+            cached is not None
+            and len(shard_fingerprint) >= len(cached.shard_fingerprint)
+            and shard_fingerprint[: len(cached.shard_fingerprint)]
+            == cached.shard_fingerprint
+        ):
+            # GOW generation shards are immutable after finalization. If the
+            # old fingerprint is an exact prefix, process only newly published
+            # generations instead of rescanning the entire campaign.
+            accumulator = cached.accumulator
+            source_count = cached.source_count
+            start_index = len(cached.shard_fingerprint)
+            for shard_path in readable_shards[start_index:]:
+                source_count += 1
+                for line_number, payload in self._read_jsonl(shard_path):
+                    source = Path(f"{shard_path}#{line_number}")
+                    accumulator.consume(payload, source=source)
+        else:
+            accumulator = _ShardRunAccumulator(run)
+            source_count = 0
+            for shard_path in readable_shards:
+                source_count += 1
+                for line_number, payload in self._read_jsonl(shard_path):
+                    source = Path(f"{shard_path}#{line_number}")
+                    accumulator.consume(payload, source=source)
 
         metadata = self._metadata_for(run.run_id, run.run_root)
         finalized = bool(metadata.get("finalized", False))
-
-        if finalized:
-            state = RunState.COMPLETED
-        else:
-            state = self._state_from_artifacts(
+        state = (
+            RunState.COMPLETED
+            if finalized
+            else self._state_from_artifacts(
                 run,
-                has_records=bool(
-                    accumulator.evaluation_count
-                ),
+                has_records=bool(accumulator.evaluation_count),
             )
-
+        )
         mean_objective = (
-            accumulator.objective_sum
-            / accumulator.successful_evaluations
+            accumulator.objective_sum / accumulator.successful_evaluations
             if accumulator.successful_evaluations
             else None
         )
         history = accumulator.history()
+        telemetry = self._launch_telemetry(run.run_root)
         snapshot = RunSnapshot(
             reference=run,
             state=state,
             evaluation_count=accumulator.evaluation_count,
             failed_evaluations=accumulator.failed_evaluations,
             result_sources=source_count,
-            successful_evaluations=(
-                accumulator.successful_evaluations
-            ),
+            successful_evaluations=accumulator.successful_evaluations,
             best_objective=accumulator.best_objective,
             latest_objective=accumulator.latest_objective,
             mean_objective=mean_objective,
@@ -857,16 +1349,29 @@ class GowFilesystemRunReader:
                 accumulator.evaluation_count > len(history)
             ),
             population_diversity=accumulator.diversity(),
+            artifact_mode="generation-shards",
+            quality_metrics_complete=True,
+            fireworks_total=telemetry.fireworks_total,
+            fireworks_completed=telemetry.fireworks_completed,
+            fireworks_fizzled=telemetry.fireworks_fizzled,
+            fireworks_archived=telemetry.fireworks_archived,
+            launches_total=telemetry.launches_total,
+            launch_manifest_generations=telemetry.manifest_generations,
+            archived_candidate_generations=telemetry.archived_candidate_generations,
+            archived_launcher_generations=telemetry.archived_launcher_generations,
+            final_launcher_archive=telemetry.final_launcher_archive,
+            launcher_inspection_errors=telemetry.inspection_errors,
         )
         result = _CachedShardRun(
-            fingerprint=fingerprint,
+            shard_fingerprint=shard_fingerprint,
+            state_fingerprint=state_fingerprint,
+            accumulator=accumulator,
+            source_count=source_count,
             snapshot=snapshot,
             history=history,
         )
-
         with self._shard_cache_lock:
             self._shard_cache[cache_key] = result
-
         return result
 
     @staticmethod
@@ -936,6 +1441,8 @@ class GowFilesystemRunReader:
             ),
             "runs_found": len(references),
             "run_ids": [reference.run_id for reference in references],
+            "data_mode": self.data_mode,
+            "summary_threshold": self.summary_threshold,
         }
 
     def _build_reference(self, run_root: Path) -> RunReference:

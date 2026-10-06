@@ -117,6 +117,18 @@ class RunSnapshot:
     population_diversity: tuple[PopulationDiversityPoint, ...] = ()
     run_started_at: float | None = None
     run_finished_at: float | None = None
+    artifact_mode: str = "legacy"
+    quality_metrics_complete: bool = True
+    fireworks_total: int = 0
+    fireworks_completed: int = 0
+    fireworks_fizzled: int = 0
+    fireworks_archived: int = 0
+    launches_total: int = 0
+    launch_manifest_generations: int = 0
+    archived_candidate_generations: int = 0
+    archived_launcher_generations: int = 0
+    final_launcher_archive: bool = False
+    launcher_inspection_errors: int = 0
 
     def __post_init__(self) -> None:
         if self.evaluation_count < 0:
@@ -131,6 +143,19 @@ class RunSnapshot:
             raise ValueError("successful_evaluations cannot exceed evaluation_count")
         if self.result_sources < 0:
             raise ValueError("result_sources cannot be negative")
+        for field_name, value in (
+            ("fireworks_total", self.fireworks_total),
+            ("fireworks_completed", self.fireworks_completed),
+            ("fireworks_fizzled", self.fireworks_fizzled),
+            ("fireworks_archived", self.fireworks_archived),
+            ("launches_total", self.launches_total),
+            ("launch_manifest_generations", self.launch_manifest_generations),
+            ("archived_candidate_generations", self.archived_candidate_generations),
+            ("archived_launcher_generations", self.archived_launcher_generations),
+            ("launcher_inspection_errors", self.launcher_inspection_errors),
+        ):
+            if value < 0:
+                raise ValueError(f"{field_name} cannot be negative")
         if (
             self.planned_evaluations is not None
             and self.planned_evaluations < 0
